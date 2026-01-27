@@ -1,0 +1,15 @@
+{
+  "name": "vad_processor",
+  "type": "module",
+  "version": "0.1.0",
+  "files": [
+    "vad_processor_bg.wasm",
+    "vad_processor.js",
+    "vad_processor.d.ts"
+  ],
+  "main": "vad_processor.js",
+  "types": "vad_processor.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}
