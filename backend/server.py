@@ -1,159 +1,180 @@
 import os
-import uuid
-import asyncio
-import numpy as np
-import io
 import logging
+import io
+import asyncio
+import edge_tts
 from datetime import datetime
-from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, WebSocket
+from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
 from groq import Groq
-from gtts import gTTS
-
-# Custom Module Imports
 from utils.emotion import analyze_emotion
 
-# Load environment variables
 load_dotenv()
-
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- GROQ ADAPTER CLASS ---
-class LlmChat:
-    def __init__(self, model="llama-3.3-70b-versatile", system_message=None):
-        self.client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-        self.model = model
-        self.system_message = system_message
+# --- CONFIGURATION ---
+MONGO_URL = os.getenv("MONGO_URL", "mongodb://127.0.0.1:27017")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-    async def chat(self, messages: list):
-        """Sends formatted messages to Groq and returns content string."""
-        formatted_messages = []
-        if self.system_message:
-             formatted_messages.append({"role": "system", "content": self.system_message})
+# --- 1. MEMORY MANAGER ---
+class MemoryManager:
+    def __init__(self, db):
+        self.conversations = db.conversations
+        self.profiles = db.user_profiles
 
-        for msg in messages:
-            if isinstance(msg, dict):
-                formatted_messages.append(msg)
-            else:
-                formatted_messages.append({"role": "user", "content": str(msg)})
+    async def get_recent_context(self, session_id: str, limit: int = 5):
+        cursor = self.conversations.find({"session_id": session_id}).sort("timestamp", -1).limit(limit)
+        history = await cursor.to_list(length=limit)
+        return history[::-1]
 
+    async def get_user_profile(self, session_id: str):
+        profile = await self.profiles.find_one({"session_id": session_id})
+        return profile.get("facts", []) if profile else []
+
+    async def save_fact(self, session_id: str, fact: str):
+        await self.profiles.update_one(
+            {"session_id": session_id},
+            {"$addToSet": {"facts": fact}},
+            upsert=True
+        )
+
+# --- 2. INTENT ROUTER ---
+class IntentRouter:
+    def __init__(self, client):
+        self.client = client
+
+    async def determine_intent(self, text: str) -> str:
+        # Hard-coded safety check
+        if any(w in text.lower() for w in ["suicide", "kill myself", "die", "end it"]):
+            return "crisis"
+        
+        prompt = "Classify user input: 'venting' (emotional), 'coaching' (advice), or 'general'. Reply ONLY with the word."
         try:
-            completion = self.client.chat.completions.create(
-                model=self.model,
-                messages=formatted_messages,
-                temperature=0.7,
-                max_tokens=1024
+            res = self.client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "system", "content": prompt}, {"role": "user", "content": text}],
+                max_tokens=5, temperature=0.1
             )
-            return completion.choices[0].message.content
-        except Exception as e:
-            logger.error(f"Groq Error: {e}")
-            return "I'm having trouble connecting to my brain right now."
+            return res.choices[0].message.content.strip().lower()
+        except:
+            return "general"
 
-# --- LIFECYCLE & APP SETUP ---
+# --- 3. AUDIO ENGINE (MP3 STREAMING) ---
+async def generate_emotional_audio(text: str, emotion: str):
+    voice = "en-US-AriaNeural"
+    pitch, rate = "+0Hz", "+0%"
+    
+    # Emotional Physics
+    if emotion == "sad":      pitch, rate = "-5Hz", "-15%"
+    elif emotion == "happy":  pitch, rate = "+5Hz", "+10%"
+    elif emotion == "angry":  pitch, rate = "+5Hz", "+15%"
+    elif emotion == "fearful": pitch, rate = "+10Hz", "+5%"
+
+    # Punctuation Hacking for Pauses (No XML)
+    clean_text = text.replace("<", "").replace(">", "").replace("&", "and")
+    final_text = clean_text.replace(", ", "... ").replace(". ", "... ")
+
+    # Generate Audio using Native Parameters
+    communicate = edge_tts.Communicate(final_text, voice, pitch=pitch, rate=rate)
+    
+    audio_fp = io.BytesIO()
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            audio_fp.write(chunk["data"])
+    audio_fp.seek(0)
+    return audio_fp
+
+# --- APP LIFECYCLE ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Connect to DB
     try:
         await db.command("ping")
-        logger.info("MongoDB connected!")
-    except Exception as e:
-        logger.warning(f"MongoDB connection failed: {e}")
+        logger.info("🟢 MongoDB Connected")
+    except Exception:
+        logger.warning("🟡 MongoDB Offline (Running in Stateless Mode)")
     yield
-    # Shutdown: Close DB
     client.close()
 
 app = FastAPI(lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# MongoDB Setup
-MONGO_URL = os.getenv("MONGO_URL", "mongodb://127.0.0.1:27017")
 client = AsyncIOMotorClient(MONGO_URL)
 db = client.emotion_voice_assistant
-conversations_collection = db.conversations
+groq_client = Groq(api_key=GROQ_API_KEY)
+memory = MemoryManager(db)
+router = IntentRouter(groq_client)
 
-# --- Pydantic Models ---
 class ConversationRequest(BaseModel):
     session_id: str
     text: str
 
-class ConversationResponse(BaseModel):
-    response: str
-    detected_emotion: str
-    confidence: float
-
-# --- API ROUTES ---
-
-@app.get("/api/health")
-async def health_check():
-    return {"status": "healthy", "service": "Emotion Voice Assistant"}
-
-@app.post("/api/conversation", response_model=ConversationResponse)
+# --- ROUTES ---
+@app.post("/api/conversation")
 async def process_conversation(request: ConversationRequest):
-    """
-    Main chat endpoint: Analyzes emotion, calls Groq, logs to DB.
-    """
-    # 1. Analyze Emotion (using your new utility)
-    emotion_data = analyze_emotion(request.text)
+    # 1. Parallel Intelligence (Emotion + Intent)
+    emotion_task = asyncio.to_thread(analyze_emotion, request.text)
+    intent_task = router.determine_intent(request.text)
+    emotion_data, intent = await asyncio.gather(emotion_task, intent_task)
 
-    # 2. Generate System Prompt based on Emotion
-    system_prompt = (
-            f"You are a supportive wellness coach. The user sounds {emotion_data['emotion']}. "
-            "Keep your response concise, under 2 sentences. Be empathetic but brief."
-        )
+    # 2. Memory Retrieval
+    history = await memory.get_recent_context(request.session_id)
+    user_facts = await memory.get_user_profile(request.session_id)
+    
+    context_str = f"Facts: {', '.join(user_facts)}\n" + \
+                  "\n".join([f"User: {h['user_text']}\nAI: {h['assistant_response']}" for h in history])
 
-    # 3. Get LLM Response
-    chat = LlmChat(system_message=system_prompt)
-    response_text = await chat.chat([{"role": "user", "content": request.text}])
+    # 3. Dynamic System Prompt
+    if intent == "venting":
+        instruction = "GOAL: Active Listening. Validate feelings. Do NOT give advice. Keep it short."
+    elif intent == "coaching":
+        instruction = "GOAL: Empowerment. Give ONE actionable step. Be encouraging. Keep it short."
+    else:
+        instruction = "Respond naturally and concisely."
 
-    # 4. Log to MongoDB (Fire and Forget)
-    conversation_log = {
-        "session_id": request.session_id,
-        "user_text": request.text,
-        "assistant_response": response_text,
-        "emotion": emotion_data["emotion"],
+    system_prompt = f"Wellness coach. Emotion: {emotion_data['emotion']}. Intent: {intent}.\n{instruction}\nContext:\n{context_str}"
+
+    # 4. Generation
+    res = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": request.text}],
+        temperature=0.7, max_tokens=150
+    )
+    response_text = res.choices[0].message.content
+
+    # 5. Persistence
+    await db.conversations.insert_one({
+        "session_id": request.session_id, "user_text": request.text,
+        "assistant_response": response_text, "emotion": emotion_data['emotion'],
+        "intent": intent, 
         "timestamp": datetime.utcnow()
-    }
-    try:
-        await conversations_collection.insert_one(conversation_log)
-    except Exception as e:
-        # Just log the warning, don't fail the request!
-        logger.warning(f"Database logging failed: {e}")
+    })
 
-    return {
-        "response": response_text,
-        "detected_emotion": emotion_data["emotion"],
-        "confidence": emotion_data["confidence"]
-    }
+    return {"response": response_text, "detected_emotion": emotion_data['emotion'], "intent": intent}
+
+@app.get("/api/history/{session_id}")
+async def get_history(session_id: str):
+    history = await memory.get_recent_context(session_id, limit=20)
+    formatted_history = []
+    for h in history:
+        formatted_history.append({"role": "user", "text": h["user_text"]})
+        formatted_history.append({
+            "role": "ai", 
+            "text": h["assistant_response"], 
+            "emotion": h.get("emotion"),
+            "intent": h.get("intent", "general")
+        })
+    return formatted_history
 
 @app.get("/api/tts")
-async def text_to_speech(text: str):
-    """
-    Streams audio for the frontend 3D avatar to lip-sync to.
-    """
-    try:
-        tts = gTTS(text=text, lang='en')
-        audio_fp = io.BytesIO()
-        tts.write_to_fp(audio_fp)
-        audio_fp.seek(0)
-        return StreamingResponse(audio_fp, media_type="audio/mpeg")
-    except Exception as e:
-        logger.error(f"TTS Error: {e}")
-        raise HTTPException(status_code=500, detail="Audio generation failed")
+async def text_to_speech(text: str, emotion: str = "neutral"):
+    audio = await generate_emotional_audio(text, emotion)
+    return StreamingResponse(audio, media_type="audio/mpeg")
 
 if __name__ == "__main__":
     import uvicorn

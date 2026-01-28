@@ -28,4 +28,4 @@ transformers>=4.35.0
 soundfile>=0.12.1
 groq
 rapidfuzz
-gTTS
+edge-tts
