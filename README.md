@@ -27,18 +27,8 @@ To prevent "State Fragmentation" and memory leaks, the system uses a **Global Re
 - **Core Logic:** Rust (VAD), Edge-TTS, Llama-3.3-70b (Reasoning)
 
 ## 🔮 Future Roadmap
-- **Frontend History Hydration:**
-   - CURRENT STATUS: Backend has `/api/history` endpoint, but Frontend ignores it.
-   - TASK: Update App.js `useEffect` to fetch history on load.
-		 - CODE: 
-		     useEffect(() => {
-		       fetch(`${backendUrl}/api/history/${sessionId}`)
-		         .then(res => res.json())
-		         .then(data => setConversationHistory(data));
-		     }, []);
 - **Crisis Guardrails:** Integration of **Nvidia NeMo Guardrails** for semantic vector-based safety checks.
 - **Dynamic Temperature:** Intent-based LLM temperature scaling (Venting: 0.9 for warmth | Coaching: 0.2 for precision).
-- **Docker Composition:** Containerization of Backend, Frontend, and Mongo for one-command deployment.
 - **Latency Profiling:** Implementing `time.perf_counter()` logging to benchmark asynchronous gain.
 - **"Double-Talk" Handling:**
    - CURRENT STATUS: Sometimes VAD triggers on AI's own voice (Echo).
